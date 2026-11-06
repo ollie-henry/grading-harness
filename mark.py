@@ -35,19 +35,36 @@ MEMORY_BYTES = 2 * 1024**3
 
 FENCE = re.compile(r"```[ \t]*(?:python3?|py)[ \t]*\r?\n(.*?)```", re.S | re.I)
 
-# Runs in its own process, held to 2 GB of memory, 512 processes and threads and 64 MB a file, so a runaway answer
-# can't use up the runner computer. In the sandbox's own user namespace only the job's processes count towards the 512;
-# outside one the user's others count too, which is why it isn't lower. Imports the tests (which import `solution` from
-# the work folder), then runs each test_* function in name order, each under its own alarm. Writes its counts to a
-# result file whose name the solution isn't given, so nothing the solution prints can pass for them; its own output goes
-# nowhere.
+# Runs in its own process, held to 2 GB of memory, 256 more processes and threads than its user already has, and
+# 64 MB a file, so a runaway answer can't use up the runner computer. The process limit counts every process and thread
+# of the user it can see, so it's set from what that user already runs (in the sandbox's own namespaces, only the job's
+# own); a fixed number would fail an ordinary threaded answer wherever the user runs much else. Imports the tests (which import
+# `solution` from the work folder), then runs each test_* function in name order, each under its own alarm. Writes its
+# counts to a result file whose name the solution isn't given, so nothing the solution prints can pass for them; its
+# own output goes nowhere.
 CHILD = r"""
-import json, resource, signal, sys
+import json, os, resource, signal, sys
 work, tests, per_test, memory, result = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
 def report(counts):
     with open(result, "w", encoding="utf-8") as f:
         json.dump(counts, f)
-for limit, value in ((resource.RLIMIT_AS, memory), (resource.RLIMIT_NPROC, 512), (resource.RLIMIT_FSIZE, 64 * 1024 * 1024)):
+def tasks_now():
+    uid, n = os.getuid(), 0
+    for d in os.listdir("/proc"):
+        if d.isdigit():
+            try:
+                with open("/proc/" + d + "/status", encoding="utf-8") as f:
+                    fields = dict(line.split(":", 1) for line in f if ":" in line)
+                if int(fields["Uid"].split()[0]) == uid:
+                    n += int(fields["Threads"])
+            except (OSError, KeyError, ValueError, IndexError):
+                pass
+    return n
+try:
+    nproc = tasks_now() + 256
+except OSError:
+    nproc = 256
+for limit, value in ((resource.RLIMIT_AS, memory), (resource.RLIMIT_NPROC, nproc), (resource.RLIMIT_FSIZE, 64 * 1024 * 1024)):
     try:
         resource.setrlimit(limit, (value, value))
     except (ValueError, OSError):
@@ -115,7 +132,9 @@ def main():
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=TOTAL_SECONDS,
-                env={"PATH": "/usr/local/bin:/usr/bin:/bin", "PYTHONHASHSEED": "0", "LANG": "C.UTF-8"},
+                # Two malloc arenas: glibc otherwise reserves 64 MB of address space for each thread's own, up to eight
+                # a core, so on a machine with several cores an answer with a hundred threads ran out of its 2 GB.
+                env={"PATH": "/usr/local/bin:/usr/bin:/bin", "PYTHONHASHSEED": "0", "LANG": "C.UTF-8", "MALLOC_ARENA_MAX": "2"},
             )
             if os.path.exists(result):
                 with open(result, encoding="utf-8") as f:
